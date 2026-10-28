@@ -1,0 +1,371 @@
+---
+title: "Analysis"
+author: "Amanda Popadich"
+date: "2025-10-23"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+params:
+  data_file: "../data_raw/anonymized_data.csv"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(2025)
+```
+
+```{r import}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(ggeffects)
+library(emmeans)
+```
+
+```{r}
+#read in the raw data
+data_path <- "../data_raw"
+files <- list.files(data_path, full.names = TRUE)
+raw <- files %>%
+  map_dfr(read_csv, .id = "file_id")
+
+# The experiment currently exports both verb versions; retain verb as a model factor.
+required_columns <- c("type", "response", "participantID", "item", "context", "verb", "factP", "person")
+missing_columns <- setdiff(required_columns, names(raw))
+if (length(missing_columns) > 0) {
+  stop("Missing required columns: ", paste(missing_columns, collapse = ", "))
+}
+if (anyNA(raw$response)) {
+  stop("Missing response values found in the trial data.")
+}
+unexpected_filler_items <- raw %>%
+  filter(type == "filler", !item %in% c(0, 2, 3, 16, 17, 18)) %>%
+  distinct(item) %>%
+  pull(item)
+if (length(unexpected_filler_items) > 0) {
+  stop("Unexpected filler item IDs: ", paste(unexpected_filler_items, collapse = ", "))
+}
+unknown_test_contexts <- raw %>%
+  filter(
+    type == "test",
+    context != "None",
+    !str_detect(context, regex("\\b(think|believe|know)\\b", ignore_case = TRUE))
+  ) %>%
+  distinct(context) %>%
+  pull(context)
+if (length(unknown_test_contexts) > 0) {
+  stop("Unrecognized test contexts found: ", paste(unknown_test_contexts, collapse = " | "))
+}
+```
+```{r}
+#checking for filler correctness, first labeling whether filler is correctly responded to or not
+raw <- raw %>%
+  mutate(correct = case_when(
+    type == "filler" & (item == 16 | item == 0) & response > 60 ~ TRUE,
+    type == "filler" & (item == 17 | item == 2) & response > 60 ~ TRUE,
+    type == "filler" & (item == 18) & response < 40 ~ TRUE,
+    type == 'filler' & item == 3 & response > 60 ~ TRUE,
+    TRUE ~ NA                         #non-fillers get NA
+  ))
+n_before <- n_distinct(raw$participantID)
+n_before
+
+#counting how many correct per participant
+filler_summary <- raw %>%
+  filter(type == "filler") %>%
+  group_by(participantID) %>%
+  summarize(
+    n_fillers = n(),
+    n_correct = sum(correct, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#count up who gets excluded 
+exclude_subjects <- filler_summary %>%
+  filter(n_correct < 2) %>%  #less than 2 correct = fail
+  pull(participantID)
+exclude_subjects
+#how many were excluded in total for both verbs
+length(exclude_subjects)
+#remove those participants from the dataset
+fails_removed <- raw %>%
+  filter(!participantID %in% exclude_subjects)
+#how many participants are left
+n_distinct(fails_removed$participantID)
+```
+Cleaning Data
+```{r}
+#remove unnecessary columns and fillers
+fillers_removed <- fails_removed %>%
+  filter(type == 'test')
+QUD_added <- fillers_removed %>%
+  mutate(QUD = case_when(
+    str_detect(context, regex("\\b(think|believe)\\b", ignore_case = TRUE)) ~ "weak",
+    str_detect(context, regex("\\bknow\\b", ignore_case = TRUE)) ~ "strong",
+    TRUE ~ "None"
+  ))
+
+clean_all <- QUD_added %>%
+  select(
+    verb,
+    response,
+    factP,
+    person,
+    item,
+    QUD,
+    participantID
+  )
+clean_all
+clean_think <- QUD_added %>%
+  filter(verb == "think") %>%
+  select(
+    response,
+    factP,
+    person,
+    item,
+    QUD,
+    participantID
+  )
+  clean_believe <- QUD_added %>%
+  filter(verb == "believe") %>%
+  select(
+    response,
+    factP,
+    person,
+    item,
+    QUD,
+    participantID
+  )
+```
+Logit Transform responses 
+```{r}
+#creating logits for responses
+
+clean_all <- clean_all %>%
+  mutate(response_logit = log(pmin(pmax(response/100, 1e-6), 1-1e-6) / (1 - pmin(pmax(response/100, 1e-6), 1-1e-6))))
+
+clean_all
+```
+Make factors correct formats and do coding
+```{r}
+#make sure categorical variables are factors with the correct level order
+clean_all <- clean_all %>%
+    mutate(
+    verb = factor(verb, levels = c("think", "believe")),
+    factP  = factor(factP, levels = c(0,1), labels = c("false", "true")),
+    person = factor(person, levels = c(1,3)), 
+    QUD    = factor(QUD, levels = c("None","weak","strong"))
+  )
+#sum coding
+contrasts(clean_all$factP) <- matrix(c(-1, 1), ncol = 1) #false = -1, true = 1
+contrasts(clean_all$person) <- contr.sum(2)    #1st = 1, 3rd = -1
+contrasts(clean_all$verb) <- contr.sum(2)
+contrasts(clean_all$verb)
+#treatment coding for QUD factor with None as clear baseline
+clean_all$QUD <- relevel(clean_all$QUD, ref = "None")
+#clean_all$verb <- relevel(clean_all$verb, ref = 'think')
+
+clean_all
+```
+Summary Statistics for All
+
+```{r}
+summary_table_all <- clean_all %>%
+  group_by(QUD, factP, person) %>%
+  summarize(
+    mean_response = mean(response),
+    sd_response = sd(response),
+    n = n(),
+    se_response = sd_response / sqrt(n),
+    .groups = "drop"
+  )
+summary_table_all
+
+#Plotting summary stats for all, averaging across verbs
+
+ggplot(summary_table_all, aes(x = QUD, y = mean_response, fill = factP)) +
+  geom_col(position = position_dodge()) +
+  geom_errorbar(aes(ymin = mean_response - se_response,
+                    ymax = mean_response + se_response),
+                width = 0.2,
+                position = position_dodge(0.9)) +
+  facet_wrap(~ person) +
+  theme_minimal() +
+  labs(
+    title = "Mean Responses by QUD, factP, and Person",
+    x = "QUD",
+    y = "Mean Response"
+  )
+
+# Collapse across 'person' using trial-level observations
+summary_table_all_collapsed <- clean_all %>%
+  group_by(QUD, factP) %>%
+  summarise(
+    mean_response = mean(response, na.rm = TRUE),
+    sd_response = sd(response, na.rm = TRUE),
+    n = n(),
+    se_response = sd_response / sqrt(n),
+    .groups = "drop"
+  )
+
+# Plot ignoring 'person'
+ggplot(summary_table_all_collapsed, aes(x = QUD, y = mean_response, fill = factP)) +
+  geom_col(position = position_dodge(),
+           color = "black") +  # black outlines
+  geom_errorbar(aes(ymin = mean_response - se_response,
+                    ymax = mean_response + se_response),
+                width = 0.2,
+                position = position_dodge(0.9)) +
+  scale_fill_grey(start = 0.3, end = 0.7) +  # gray shades
+  theme_minimal(base_size = 14) +  # light background and grid
+  labs(
+    title = "All Verbs",
+    x = "QUD",
+    y = "Mean Response",
+    fill = "factP"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    panel.grid.major = element_line(color = "gray85", size = 0.4),
+    panel.grid.minor = element_line(color = "gray90", size = 0.2),
+    axis.line = element_line(color = "black")  # add black axes for contrast
+  )
+
+
+```
+
+
+```{r}
+# Summary statistics collapsed across person, separated by verb
+summary_table_by_verb <- clean_all %>%
+  group_by(verb, QUD, factP) %>%
+  summarize(
+    mean_response = mean(response, na.rm = TRUE),
+    sd_response   = sd(response, na.rm = TRUE),
+    n             = n(),
+    se_response   = sd_response / sqrt(n),
+    .groups = "drop"
+  )
+
+# -------------------------
+# THINK plot
+# -------------------------
+think_summary <- summary_table_by_verb %>%
+  filter(verb == "think")
+
+ggplot(think_summary,
+       aes(x = QUD, y = mean_response, fill = factP)) +
+  geom_col(position = position_dodge(),
+           color = "black") +
+  geom_errorbar(aes(ymin = mean_response - se_response,
+                    ymax = mean_response + se_response),
+                width = 0.2,
+                position = position_dodge(0.9)) +
+  scale_fill_grey(start = 0.3, end = 0.7) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Think",
+    x = "QUD",
+    y = "Mean Response",
+    fill = "factP"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.major = element_line(color = "gray85", size = 0.4),
+    panel.grid.minor = element_line(color = "gray90", size = 0.2),
+    axis.line = element_line(color = "black")
+  )
+
+# -------------------------
+# BELIEVE plot
+# -------------------------
+believe_summary <- summary_table_by_verb %>%
+  filter(verb == "believe")
+
+ggplot(believe_summary,
+       aes(x = QUD, y = mean_response, fill = factP)) +
+  geom_col(position = position_dodge(),
+           color = "black") +
+  geom_errorbar(aes(ymin = mean_response - se_response,
+                    ymax = mean_response + se_response),
+                width = 0.2,
+                position = position_dodge(0.9)) +
+  scale_fill_grey(start = 0.3, end = 0.7) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Believe",
+    x = "QUD",
+    y = "Mean Response",
+    fill = "factP"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.major = element_line(color = "gray85", size = 0.4),
+    panel.grid.minor = element_line(color = "gray90", size = 0.2),
+    axis.line = element_line(color = "black")
+  )
+
+
+```
+
+
+
+Modeling Results
+```{r}
+model_full_ml <- lmer(
+  response_logit ~ verb * QUD * factP * person +
+    (1 | participantID) +
+    (1 | item),
+  data = clean_all,
+  REML = FALSE
+)
+summary(model_full_ml)
+isSingular(model_full_ml)
+```
+Goodness of Fit Testing
+```{r}
+model_noPerson <- lmer(
+  response_logit ~ verb * QUD * factP  +
+    (1 | participantID) +
+    (1 | item),
+  data = clean_all,
+  REML = FALSE
+)
+
+model_noFact <- lmer(
+  response_logit ~ verb * QUD * person  +
+    (1 | participantID) +
+    (1 | item),
+  data = clean_all,
+  REML = FALSE
+)
+
+model_noQUD <- lmer(
+  response_logit ~ verb * factP * person  +
+    (1 | participantID) +
+    (1 | item),
+  data = clean_all,
+  REML = FALSE
+)
+
+model_noVerb <- lmer(
+  response_logit ~ QUD * factP * person  +
+    (1 | participantID) +
+    (1 | item),
+  data = clean_all,
+  REML = FALSE
+)
+
+anova(model_full_ml, model_noPerson)
+anova(model_full_ml, model_noFact)
+anova(model_full_ml, model_noQUD)
+anova(model_full_ml, model_noVerb)
+
+# Refit the selected full model with REML for final parameter estimates.
+max_model_all <- update(model_full_ml, REML = TRUE)
+summary(max_model_all)
+```

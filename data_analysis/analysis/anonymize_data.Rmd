@@ -1,0 +1,48 @@
+---
+title: "anonymize_data"
+author: "Amanda Popadich"
+date: "2026-02-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(2025)
+```
+
+```{r import}
+library(tidyverse)
+```
+
+```{r}
+
+library(tidyverse)
+
+# Read in the raw data
+data_path <- "../data_raw"
+files <- list.files(data_path, full.names = TRUE)
+raw <- files %>%
+  map_dfr(read_csv, .id = "file_id")
+
+# Filter out survey-text rows and select relevant columns
+anonymized <- raw %>%
+  filter(trial_type != "survey-text") %>%  # remove survey-text rows
+  select(
+    sentence,
+    type,
+    verb,
+    context,
+    response,
+    factP,
+    person,
+    item,
+    participantID
+  ) %>%
+  # Anonymize participantID
+  mutate(participantID = factor(participantID),        # ensure unique IDs are recognized
+         participantID = paste0("P", as.integer(participantID)))  # assign P1, P2, ...
+
+```
+```{r}
+write_csv(anonymized, "../anonymized_data.csv")
+```

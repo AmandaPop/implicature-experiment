@@ -1,0 +1,10 @@
+.DS_Store
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata/
+
+# Private study exports and generated analysis files
+data_analysis/data_raw/
+data_analysis/Pilot*/
+*.csv~
